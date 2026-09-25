@@ -19,6 +19,7 @@
 #define APP_LAUNCH_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Does APP_BASE_ADDR look like a valid, programmed image (sane SP + reset
  * vector, not just erased 0xFF)? */
@@ -28,5 +29,20 @@ bool app_launch_present(void);
  * Does not return on success. Returns (with the bootloader still running) only
  * if no valid image is present or the chosen launch method refused. */
 void app_launch_run(void);
+
+/*
+ * Region-parametrised versions of the two functions above. app_launch_present()
+ * and app_launch_run() are thin wrappers around these for
+ * (APP_BASE_ADDR, APP_END_ADDR); the Fruit Jam retro-TV hand-off uses them
+ * directly for (TV_BASE_ADDR, TV_END_ADDR) -- see boot_config.h. `base` and
+ * `end` are absolute XIP addresses framing the candidate region.
+ *
+ * app_launch_run_at() only supports the classic vector-table jump (the
+ * BOOT_USE_ROM_CHAIN=1 path in app_launch.c is unmodified and still only
+ * targets APP_BASE_ADDR/APP_PARTITION_SIZE; that combination is not used by
+ * the Fruit Jam build).
+ */
+bool app_launch_present_at(uint32_t base, uint32_t end);
+void app_launch_run_at(uint32_t base, uint32_t end);
 
 #endif /* APP_LAUNCH_H */
