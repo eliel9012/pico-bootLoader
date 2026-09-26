@@ -14,14 +14,9 @@
 #define BOOT_USE_ROM_CHAIN 0
 #endif
 
-static const uint32_t *app_vectors(void)
+bool app_launch_present_at(uint32_t base, uint32_t end)
 {
-    return (const uint32_t *)APP_BASE_ADDR;
-}
-
-bool app_launch_present(void)
-{
-    const uint32_t *vt = app_vectors();
+    const uint32_t *vt = (const uint32_t *)base;
     uint32_t sp    = vt[0];
     uint32_t reset = vt[1];
 
@@ -31,10 +26,15 @@ bool app_launch_present(void)
     /* Initial stack pointer must land in SRAM and be word aligned. */
     if (sp < SRAM_BASE || sp > SRAM_END_ADDR || (sp & 0x3u))
         return false;
-    /* Reset vector must point into the application partition with the Thumb bit. */
-    if (reset < APP_BASE_ADDR || reset >= APP_END_ADDR || !(reset & 0x1u))
+    /* Reset vector must point into the target region with the Thumb bit. */
+    if (reset < base || reset >= end || !(reset & 0x1u))
         return false;
     return true;
+}
+
+bool app_launch_present(void)
+{
+    return app_launch_present_at(APP_BASE_ADDR, APP_END_ADDR);
 }
 
 #if BOOT_USE_ROM_CHAIN
@@ -60,15 +60,26 @@ void app_launch_run(void)
     /* If we get here the chain was refused; let the caller keep running. */
 }
 
+/* The Fruit Jam TV hand-off (region other than the app partition) only has a
+ * classic vector-table implementation below (BOOT_USE_ROM_CHAIN==0, "the
+ * tested default" per app_launch.h). This build was configured with
+ * BOOT_USE_ROM_CHAIN==1, so calling this for any other region is a no-op
+ * that safely returns -- the loader falls back to showing the picker. */
+void app_launch_run_at(uint32_t base, uint32_t end)
+{
+    (void)base;
+    (void)end;
+}
+
 #else
 /* --------- Classic vector-table jump path (default) --------- */
 
-void app_launch_run(void)
+void app_launch_run_at(uint32_t base, uint32_t end)
 {
-    if (!app_launch_present())
+    if (!app_launch_present_at(base, end))
         return;
 
-    const uint32_t *vt = app_vectors();
+    const uint32_t *vt = (const uint32_t *)base;
     uint32_t app_sp    = vt[0];
     uint32_t app_reset = vt[1];
 
@@ -89,7 +100,7 @@ void app_launch_run(void)
     }
 
     /* Point the CPU at the application's vector table. */
-    SCB->VTOR = APP_BASE_ADDR;
+    SCB->VTOR = base;
 
     /* ARMv8-M: clear the main stack-limit so the app can set its own, switch to
      * the MSP in privileged thread mode, then load the app's stack pointer. */
@@ -108,5 +119,10 @@ void app_launch_run(void)
     ((void (*)(void))app_reset)();
 
     __builtin_unreachable();
+}
+
+void app_launch_run(void)
+{
+    app_launch_run_at(APP_BASE_ADDR, APP_END_ADDR);
 }
 #endif

@@ -969,6 +969,13 @@ void showUsbDriveScreen()
 }
 #endif // FRENS_USB_MSC
 
+#if TV_RESERVED_SIZE > 0
+// Forward declarations: defined further down (next to handoffToApp()), used
+// here by showOptionsScreen()'s "Return to TV" entry.
+static bool tv_launch_present();
+[[noreturn]] void handoffToTv();
+#endif
+
 // --- Options menu (SELECT) --------------------------------------------------
 //
 // The picker's secondary screen: help, the text/graphical toggle, BOOTSEL mode
@@ -981,13 +988,16 @@ enum OptionsResult {
     OPT_MODE_CHANGED,   // ini->gui_graphical was flipped
 };
 
-// Entry ids rather than array indices: the USB row is compiled out on builds
-// without FRENS_USB_MSC and the rows must close up behind it.
+// Entry ids rather than array indices: the USB row (FRENS_USB_MSC) and the
+// Fruit Jam "return to TV" row (TV_RESERVED_SIZE, and only once a TV image is
+// actually flashed) are each compiled/conditioned out independently and the
+// rows must close up behind whichever ones are missing.
 enum OptionId {
     OPTID_HELP,
     OPTID_MENU_MODE,
     OPTID_BOOTSEL,
     OPTID_USB_DRIVE,
+    OPTID_RETURN_TO_TV,
 };
 
 #define OPT_FIRST_ROW  6    // first entry row; entries are two rows apart
@@ -1023,6 +1033,7 @@ void drawOptionsScreen(const OptionId *ids, int count, int sel,
                                break;
         case OPTID_BOOTSEL:    label = "Enter BOOTSEL mode"; break;
         case OPTID_USB_DRIVE:  label = "USB drive mode";     break;
+        case OPTID_RETURN_TO_TV: label = "Return to TV";     break;
         }
         putText(OPT_LABEL_COL, row, label,
                 here ? COL_HELP_HDR : COL_FG, COL_BG);
@@ -1037,6 +1048,7 @@ void drawOptionsScreen(const OptionId *ids, int count, int sel,
     case OPTID_MENU_MODE: hint = "Application list, or full-screen artwork"; break;
     case OPTID_BOOTSEL:   hint = "Restart for flashing over USB"; break;
     case OPTID_USB_DRIVE: hint = "Show the SD card on your computer"; break;
+    case OPTID_RETURN_TO_TV: hint = "Go back to the Fruit Jam retro-TV"; break;
     }
     centerText(20, hint, COL_FG, COL_BG);
 
@@ -1056,13 +1068,21 @@ OptionsResult showOptionsScreen(sd_boot_ini_t *ini, bool *cfg_save_failed,
 {
     using Btn = io::GamePadState::Button;
 
-    OptionId ids[4];
+    OptionId ids[5];
     int count = 0;
     ids[count++] = OPTID_HELP;
     ids[count++] = OPTID_MENU_MODE;
     ids[count++] = OPTID_BOOTSEL;
 #if FRENS_USB_MSC
     ids[count++] = OPTID_USB_DRIVE;
+#endif
+#if TV_RESERVED_SIZE > 0
+    // Only offer it once there is actually somewhere to go back to -- e.g. a
+    // Fruit Jam that has run this loader's own build but never flashed the TV
+    // firmware in its reserved region yet.
+    if (tv_launch_present()) {
+        ids[count++] = OPTID_RETURN_TO_TV;
+    }
 #endif
 
     const bool mode_on_entry = ini->gui_graphical;
@@ -1137,6 +1157,15 @@ OptionsResult showOptionsScreen(sd_boot_ini_t *ini, bool *cfg_save_failed,
                 showUsbDriveScreen();   // may reboot instead of returning
                 prev  = ~0u;
                 dirty = true;
+#endif
+                break;
+
+            case OPTID_RETURN_TO_TV:
+#if TV_RESERVED_SIZE > 0
+                LOG("Options -> Return to TV.");
+                showMessage("Starting", "Fruit Jam retro-TV", nullptr);
+                DrawScreen(-1);
+                handoffToTv();   // no return on success
 #endif
                 break;
             }
@@ -1683,6 +1712,60 @@ static AuxState computeAuxDrift(int idx, uf2_fingerprint_t *out_fp)
     return AUX_DRIFT;
 }
 
+// --- Fruit Jam retro-TV hand-off --------------------------------------------
+//
+// Local to this fork (not part of the pico_shared bootloader<->emulator
+// handshake in FrensHelpers.cpp, which only knows about the app partition).
+// scratch[BOOT_LAST_REGION_SCRATCH] records which resident region (TV or the
+// emulator app partition) was jumped to last, so a *warm* reboot -- one an
+// app triggers on itself with watchdog_reboot(), as opposed to a cold
+// power-on/RUN-pin reset -- resumes the same one instead of falling back to
+// whatever the original (TV-less) loader always assumed: the app partition.
+// A cold boot ignores this register entirely (see the RESUME CHECK in
+// main()) and always tries the TV first, which is requirement #1 of the
+// Fruit Jam port.
+//
+// This is a *different* scratch register from the pico_shared protocol:
+//   scratch[6] (0xB007ED01, Frens::markLaunchedFromBootloader()) still means
+//     "the loader launched me" and is set for the TV exactly as for an
+//     emulator -- the TV reads it directly (it does not link pico_shared) to
+//     show a "voltar para os emuladores" option only when that makes sense.
+//   scratch[7] (0xB007BACE, Frens::rebootToBootloader()) still means "show
+//     the picker": an emulator returning, AND the TV asking to open the
+//     emulator menu, write the exact same thing (scratch[7]=0xB007BACE then
+//     watchdog_reboot()) from the caller's side, so the loader's existing
+//     Frens::consumeReturnToBootloaderRequest() check needs no change here.
+#define BOOT_LAST_REGION_SCRATCH 5
+static constexpr uint32_t BOOT_REGION_TV_MAGIC  = 0x54562E31u;  // "TV.1"
+static constexpr uint32_t BOOT_REGION_APP_MAGIC = 0x454D5521u;  // "EMU!"
+
+#if TV_RESERVED_SIZE > 0
+// Is there a runnable image at TV_BASE_ADDR? Same sanity checks as
+// app_launch_present(), just aimed at the other end of flash.
+static bool tv_launch_present()
+{
+    return app_launch_present_at(TV_BASE_ADDR, TV_END_ADDR);
+}
+
+// Minimal jump used from main(), before Frens::initAll() brings up the
+// display/SD/USB/wiipad -- there is nothing running yet to tear down, unlike
+// handoffToTv() below. Mirrors the original resume path's direct
+// markLaunchedFromBootloader()+app_launch_run() (see the RESUME CHECK).
+[[noreturn]] static void jumpToTvEarly()
+{
+    watchdog_hw->scratch[BOOT_LAST_REGION_SCRATCH] = BOOT_REGION_TV_MAGIC;
+    stdio_flush();
+    Frens::markLaunchedFromBootloader();
+    app_launch_run_at(TV_BASE_ADDR, TV_END_ADDR);
+    // Only reached if the image failed validation between the presence check
+    // and here, which needs flash to change mid-boot -- not expected, but
+    // fall back to the picker rather than spin.
+    LOG("jumpToTvEarly: app_launch_run_at() returned unexpectedly.");
+    watchdog_reboot(0, 0, 0);
+    for (;;) tight_loop_contents();
+}
+#endif // TV_RESERVED_SIZE > 0
+
 // Do the final "hand off to the emulator" sequence: quiesce I2C/core1, mark
 // the handshake register, and VTOR-jump. Never returns on success.
 [[noreturn]] void handoffToApp(const char *label)
@@ -1693,12 +1776,35 @@ static AuxState computeAuxDrift(int idx, uf2_fingerprint_t *out_fp)
     wiipad_end();
 #endif
     multicore_reset_core1();   // hand HSTX over; emulator brings its own driver up
+    watchdog_hw->scratch[BOOT_LAST_REGION_SCRATCH] = BOOT_REGION_APP_MAGIC;
     Frens::markLaunchedFromBootloader();
     app_launch_run();          // VTOR jump; no return on success
     LOG("app_launch_run() returned unexpectedly.");
     watchdog_reboot(0, 0, 0);
     for (;;) tight_loop_contents();
 }
+
+#if TV_RESERVED_SIZE > 0
+// Same sequence as handoffToApp(), aimed at the TV region instead. Used from
+// the fully-initialised picker UI (the options menu's "Return to TV" entry),
+// where core1/wiipad may actually be running and need the same teardown an
+// emulator hand-off gets. jumpToTvEarly() above is the pre-init equivalent.
+[[noreturn]] void handoffToTv()
+{
+    LOG("Launching Fruit Jam retro-TV; bye!");
+    stdio_flush();
+#if WII_PIN_SDA >= 0 and WII_PIN_SCL >= 0
+    wiipad_end();
+#endif
+    multicore_reset_core1();
+    watchdog_hw->scratch[BOOT_LAST_REGION_SCRATCH] = BOOT_REGION_TV_MAGIC;
+    Frens::markLaunchedFromBootloader();
+    app_launch_run_at(TV_BASE_ADDR, TV_END_ADDR);
+    LOG("app_launch_run_at(TV) returned unexpectedly.");
+    watchdog_reboot(0, 0, 0);
+    for (;;) tight_loop_contents();
+}
+#endif // TV_RESERVED_SIZE > 0
 
 // Launch the already-flashed emulator. No flash op; just quiesce and jump.
 void launchInFlash()
@@ -1924,34 +2030,74 @@ int main()
     LOG("Build: %s %s   SDK: " PICO_SDK_VERSION_STRING, __DATE__, __TIME__);
     LOG("HW_CONFIG=%d  sys_clk=%lu Hz  vreg=1.30V",
         HW_CONFIG, (unsigned long)clock_get_hz(clk_sys));
-    LOG("Flash map: bootloader [0x%08X..0x%08X)  app [0x%08X..0x%08X)",
+    LOG("Flash map: bootloader [0x%08X..0x%08X)  app [0x%08X..0x%08X)  tv [0x%08X..0x%08X)",
         (unsigned)XIP_BASE,     (unsigned)APP_BASE_ADDR,
-        (unsigned)APP_BASE_ADDR,(unsigned)APP_END_ADDR);
-    LOG("App partition size: %u bytes (%u KB)",
-        (unsigned)APP_PARTITION_SIZE, (unsigned)(APP_PARTITION_SIZE / 1024));
+        (unsigned)APP_BASE_ADDR,(unsigned)APP_END_ADDR,
+        (unsigned)TV_BASE_ADDR, (unsigned)TV_END_ADDR);
+    LOG("App partition size: %u bytes (%u KB)  TV reserve: %u bytes (%u KB)",
+        (unsigned)APP_PARTITION_SIZE, (unsigned)(APP_PARTITION_SIZE / 1024),
+        (unsigned)TV_RESERVED_SIZE, (unsigned)(TV_RESERVED_SIZE / 1024));
     logBootCause();
     logAppPartitionState("at boot");
+#if TV_RESERVED_SIZE > 0
+    {
+        const uint32_t *vt = (const uint32_t *)TV_BASE_ADDR;
+        LOG("TV partition at boot: SP=0x%08X  reset=0x%08X  tv_launch_present=%d",
+            (unsigned)vt[0], (unsigned)vt[1], (int)tv_launch_present());
+    }
+#endif
 
     // --- RESUME CHECK -------------------------------------------------------
-    // If the previously-running emulator asked to return to the picker
-    // (Frens::rebootToBootloader() before its watchdog_reboot), honour that
-    // request and fall through to the menu even though watchdog_enable
-    // would otherwise trigger the resume jump.
+    // Three possible destinations now, not two: the picker, the emulator app
+    // partition, or (Fruit Jam only) the TV region. See the big comment above
+    // handoffToApp()/handoffToTv() for the scratch-register protocol.
+    //
+    // If the previously-running app asked to return to the picker
+    // (Frens::rebootToBootloader() before its watchdog_reboot -- an emulator
+    // via pico_shared, or the TV doing the identical scratch[7] write itself),
+    // honour that request and fall through to the menu even though
+    // watchdog_enable would otherwise trigger a resume jump.
     bool returnRequested = Frens::consumeReturnToBootloaderRequest();
     if (returnRequested) {
-        LOG("Return-to-loader requested by app; skipping resume jump.");
+        LOG("Return-to-loader requested; skipping resume jump.");
     }
-    if (!returnRequested && watchdog_enable_caused_reboot() && app_launch_present()) {
+
+    // A *warm* reboot is one an app triggered on itself with watchdog_reboot()
+    // (checked via the SDK's watchdog_enable_caused_reboot(), which is exactly
+    // the pre-existing test this loader always used to decide "picker or
+    // resume"). Anything else -- power-on, RUN-pin reset -- is a cold boot.
+    bool warmReboot = !returnRequested && watchdog_enable_caused_reboot();
+
+#if TV_RESERVED_SIZE > 0
+    // Requirement #1 (cold boot goes straight to the TV) and requirement #4
+    // ("normal reset returns to the TV") fall out of the same condition: any
+    // non-warm, non-return-requested boot. A warm reboot instead resumes
+    // whichever region was active before it, from scratch[5] -- defaulting to
+    // "not TV" (i.e. try the app partition next) for a register that was never
+    // written, which reproduces the pre-TV loader's behaviour exactly.
+    uint32_t lastRegion = warmReboot ? watchdog_hw->scratch[BOOT_LAST_REGION_SCRATCH] : 0;
+    bool wantsTv = !returnRequested && (!warmReboot || lastRegion == BOOT_REGION_TV_MAGIC);
+    if (wantsTv && tv_launch_present()) {
+        LOG("%s: jumping to the Fruit Jam retro-TV at 0x%08X",
+            warmReboot ? "Resume path" : "Cold boot", (unsigned)TV_BASE_ADDR);
+        jumpToTvEarly();   // no return on success
+        LOG("TV image missing/invalid at 0x%08X; falling through.", (unsigned)TV_BASE_ADDR);
+    } else if (!warmReboot) {
+        LOG("Cold boot: no TV image flashed yet; showing emulator picker.");
+    }
+#endif
+
+    if (warmReboot && app_launch_present()) {
         LOG("Resume path: watchdog_enable=true and app image valid");
         LOG("Jumping to app reset vector at 0x%08X (no return on success)",
             (unsigned)((const uint32_t *)APP_BASE_ADDR)[1]);
         stdio_flush();
+        watchdog_hw->scratch[BOOT_LAST_REGION_SCRATCH] = BOOT_REGION_APP_MAGIC;
         Frens::markLaunchedFromBootloader();
         app_launch_run();
         LOG("Resume refused (no valid image); falling through to menu.");
-    } else {
-        LOG("No resume: showing emulator picker.");
     }
+    LOG("No resume: showing emulator picker.");
 
     // --- FULL INIT (display/SD/USB/input via the shared framework) ----------
     LOG("Initializing shared framework (display/SD/USB/audio)...");

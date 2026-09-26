@@ -95,6 +95,33 @@ message("PIO USB support: ${ENABLE_PIO_USB}, using PIO: ${PIO_USB_USE_PIO}")
 include("pico_shared/BootPartition.cmake")
 
 # ---------------------------------------------------------------------------
+# Fruit Jam retro-TV: reserve the top of flash for the always-resident TV
+# firmware (fruitjam-retro-tv, a fork of m5-retro-tv). BootPartition.cmake
+# above lives in the pico_shared submodule -- a separate upstream repo shared
+# with every emulator -- and hands the whole app partition to FRENS_APP_SIZE
+# with no notion of a third region. Rather than patch that submodule (this
+# fork's boundary is this repository; pico_shared stays upstream-clean), we
+# shrink FRENS_APP_SIZE here, in the including scope, right after it is set.
+# CMake functions resolve an unset local variable by looking at its value in
+# the *calling* scope at invocation time, so frens_offset_for_bootloader()
+# (called later, for each emulator/app target) sees the shrunk value without
+# any change to BootPartition.cmake itself.
+#
+# FRENS_TV_SIZE=0 (every board except Fruit Jam) reproduces the original
+# partition map exactly. Override on the command line, e.g.
+# -DFRENS_TV_SIZE=0x400000, to change the reserve without editing this file.
+if (NOT DEFINED FRENS_TV_SIZE)
+    if (HW_CONFIG EQUAL 8)
+        set(FRENS_TV_SIZE "0x400000")  # 4 MB at the very top of a 16 MB chip
+    else()
+        set(FRENS_TV_SIZE "0x0")
+    endif()
+endif()
+math(EXPR FRENS_APP_SIZE "${FRENS_APP_SIZE} - ${FRENS_TV_SIZE}" OUTPUT_FORMAT HEXADECIMAL)
+math(EXPR FRENS_TV_BASE  "${FRENS_XIP_BASE} + ${FRENS_FLASH_TOTAL} - ${FRENS_TV_SIZE}" OUTPUT_FORMAT HEXADECIMAL)
+message(STATUS "Fruit Jam retro-TV reserve: FRENS_TV_SIZE=${FRENS_TV_SIZE} FRENS_TV_BASE=${FRENS_TV_BASE}  (app partition shrunk to FRENS_APP_SIZE=${FRENS_APP_SIZE})")
+
+# ---------------------------------------------------------------------------
 # Executable
 # ---------------------------------------------------------------------------
 add_executable(${projectname}
@@ -214,6 +241,7 @@ target_compile_definitions(${projectname} PRIVATE
     # Flash map for src/boot_config.h (kept in sync with BootPartition.cmake).
     BOOTLOADER_SIZE=${FRENS_BOOTLOADER_SIZE}
     FLASH_TOTAL_SIZE=${FRENS_FLASH_TOTAL}
+    TV_RESERVED_SIZE=${FRENS_TV_SIZE}
 )
 # ---------------------------------------------------------------------------
 # USB drive mode: the "USB drive mode" entry in the options menu (SELECT) shows
